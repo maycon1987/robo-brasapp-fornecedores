@@ -64,13 +64,17 @@ async def coletar(limite: int = 5):
                 'input'
             ], BRASAPP_EMAIL)
 
-            senha_ok = await preencher_primeiro(page, [
-                'input[type="password"]',
-                'input[name="password"]',
-                'input[name="senha"]',
-                'input[id*="password"]',
-                'input[placeholder*="senha" i]'
-            ], BRASAPP_SENHA)
+           senha_ok = await preencher_primeiro(page, [
+    'input[type="password"]',
+    'input[name="password"]',
+    'input[name="senha"]',
+    'input[id*="password"]',
+    'input[id*="senha"]',
+    'input[placeholder*="senha" i]',
+    'input[placeholder*="password" i]',
+    'input[type="text"]',
+    'input'
+], BRASAPP_SENHA)
 
             if not email_ok or not senha_ok:
                 html_inicio = (await page.content())[:1000]
