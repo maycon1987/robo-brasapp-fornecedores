@@ -48,9 +48,9 @@ def coletar():
             })
 
             if supabase:
-                supabase.table("contatos").insert({
-                    "telefone": nome
-                }).execute()
+                supabase.table("fornecedores_brasapp").insert({
+    "nome": nome
+}).execute()
 
     return {
         "total_encontrados": len(fornecedores),
