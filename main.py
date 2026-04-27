@@ -92,11 +92,9 @@ async def pegar_links_fornecedores(page, limite):
         if not href.startswith("https://bras.app/"):
             continue
 
-        # filtro principal: perfil real de fornecedor
         if "lista-de-fornecedores-de-roupas-no-atacado-bras-resultado/" not in href:
             continue
 
-        # ignora lixo/menu/logout
         bloqueados = [
             "member-logout",
             "logout",
@@ -116,7 +114,6 @@ async def pegar_links_fornecedores(page, limite):
             continue
 
         if len(nome) < 2:
-            # se o link não tiver texto, tenta usar slug da URL
             slug = href.rstrip("/").split("/")[-1]
             nome = slug.replace("-", " ").title()
 
@@ -181,6 +178,19 @@ async def extrair_fornecedor(page, fornecedor):
     }
 
 
+def fornecedor_ja_existe(link_perfil):
+    consulta = (
+        supabase
+        .table("fornecedores_brasapp")
+        .select("id, link_perfil")
+        .eq("link_perfil", link_perfil)
+        .limit(1)
+        .execute()
+    )
+
+    return bool(consulta.data)
+
+
 @app.get("/coletar")
 async def coletar(limite: int = 3):
     if not supabase:
@@ -190,6 +200,7 @@ async def coletar(limite: int = 3):
         return {"status": "erro", "erro": "BRASAPP_EMAIL ou BRASAPP_SENHA não configurados"}
 
     coletados = []
+    pulados = []
     erros = []
 
     try:
@@ -232,12 +243,19 @@ async def coletar(limite: int = 3):
 
             for fornecedor in fornecedores:
                 try:
+                    link_perfil = fornecedor["link"]
+
+                    if fornecedor_ja_existe(link_perfil):
+                        pulados.append({
+                            "nome": fornecedor["nome"],
+                            "link_perfil": link_perfil,
+                            "motivo": "já existia no Supabase"
+                        })
+                        continue
+
                     registro = await extrair_fornecedor(page, fornecedor)
 
-                    supabase.table("fornecedores_brasapp").upsert(
-                        registro,
-                        on_conflict="link_perfil"
-                    ).execute()
+                    supabase.table("fornecedores_brasapp").insert(registro).execute()
 
                     coletados.append(registro)
 
@@ -251,9 +269,12 @@ async def coletar(limite: int = 3):
 
             return {
                 "status": "finalizado",
-                "total_coletado": len(coletados),
+                "total_encontrado_na_pagina": len(fornecedores),
+                "total_coletado_novo": len(coletados),
+                "total_pulado_repetido": len(pulados),
                 "total_erros": len(erros),
                 "dados": coletados,
+                "pulados": pulados,
                 "erros": erros
             }
 
