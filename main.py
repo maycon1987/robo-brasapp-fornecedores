@@ -62,13 +62,14 @@ async def fazer_login(page):
     return "Sair" in html or "logout" in html or "Minha conta" in titulo
 
 
-async def carregar_lista(page):
+async def carregar_lista(page, scrolls=30):
     await page.goto(URL_LISTA, wait_until="domcontentloaded", timeout=60000)
     await page.wait_for_timeout(12000)
 
-    for _ in range(8):
-        await page.mouse.wheel(0, 3000)
-        await page.wait_for_timeout(2000)
+    for i in range(scrolls):
+        print(f"Scroll {i + 1}/{scrolls}")
+        await page.mouse.wheel(0, 3500)
+        await page.wait_for_timeout(1500)
 
 
 async def pegar_links_fornecedores(page, limite):
@@ -192,7 +193,7 @@ def fornecedor_ja_existe(link_perfil):
 
 
 @app.get("/coletar")
-async def coletar(limite: int = 3):
+async def coletar(limite: int = 50, scrolls: int = 30):
     if not supabase:
         return {"status": "erro", "erro": "Supabase não configurado"}
 
@@ -227,7 +228,7 @@ async def coletar(limite: int = 3):
                     "mensagem": "Login não confirmado"
                 }
 
-            await carregar_lista(page)
+            await carregar_lista(page, scrolls)
 
             fornecedores = await pegar_links_fornecedores(page, limite)
 
@@ -269,6 +270,8 @@ async def coletar(limite: int = 3):
 
             return {
                 "status": "finalizado",
+                "limite": limite,
+                "scrolls": scrolls,
                 "total_encontrado_na_pagina": len(fornecedores),
                 "total_coletado_novo": len(coletados),
                 "total_pulado_repetido": len(pulados),
