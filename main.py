@@ -24,6 +24,13 @@ def limpar_texto(texto):
     return re.sub(r"\s+", " ", texto).strip()
 
 
+def limpar_whatsapp(link):
+    if not link:
+        return ""
+    numeros = re.findall(r"\d+", link)
+    return "".join(numeros) if numeros else link
+
+
 @app.get("/")
 def home():
     return {"status": "online", "app": "robo-brasapp-fornecedores"}
@@ -46,7 +53,6 @@ async def fazer_login(page):
     await page.fill("#username", BRASAPP_EMAIL, timeout=15000)
     await page.fill("#password", BRASAPP_SENHA, timeout=15000)
 
-    # Botão correto do formulário de login
     botao = page.locator("form.login button[type='submit']").first
 
     if await botao.count() > 0:
@@ -86,24 +92,6 @@ async def pegar_links(page):
         if "lista-de-fornecedores-de-roupas-no-atacado-bras-resultado/" not in href:
             continue
 
-        bloqueados = [
-            "member-logout",
-            "logout",
-            "minha-conta",
-            "lost-password",
-            "register",
-            "produto",
-            "contato",
-            "category=",
-            "region=",
-            "sort=",
-            "tab=",
-            "#",
-        ]
-
-        if any(b in href.lower() for b in bloqueados):
-            continue
-
         if href in vistos:
             continue
 
@@ -113,10 +101,7 @@ async def pegar_links(page):
             slug = href.rstrip("/").split("/")[-1]
             nome = slug.replace("-", " ").title()
 
-        fornecedores.append({
-            "nome": nome,
-            "link": href
-        })
+        fornecedores.append({"nome": nome, "link": href})
 
     return fornecedores
 
@@ -129,9 +114,7 @@ async def navegar_paginas(page, limite=300, paginas=10):
     await page.wait_for_timeout(10000)
 
     for pagina in range(1, paginas + 1):
-        print(f"Página {pagina}")
-
-        await page.wait_for_timeout(5000)
+        await page.wait_for_timeout(4000)
 
         fornecedores = await pegar_links(page)
 
@@ -154,11 +137,9 @@ async def navegar_paginas(page, limite=300, paginas=10):
                 await botao_pagina.click(timeout=10000)
                 await page.wait_for_timeout(8000)
             else:
-                print("Fim das páginas")
                 break
 
-        except Exception as e:
-            print("Erro ao clicar na próxima página:", e)
+        except Exception:
             break
 
     return todos
@@ -179,6 +160,7 @@ async def extrair_fornecedor(page, fornecedor):
 
     instagram = ""
     whatsapp = ""
+    site = ""
 
     links = await page.locator("a").evaluate_all("""
         els => els.map(a => ({
@@ -201,10 +183,56 @@ async def extrair_fornecedor(page, fornecedor):
         ):
             whatsapp = href
 
+        if (
+            not site
+            and href.startswith("http")
+            and "bras.app" not in href
+            and "instagram.com" not in href
+            and "wa.me" not in href
+            and "whatsapp" not in href.lower()
+        ):
+            site = href
+
+    texto_pagina = ""
+    try:
+        texto_pagina = await page.locator("body").inner_text()
+        texto_pagina = limpar_texto(texto_pagina)
+    except Exception:
+        pass
+
+    endereco = ""
+    produtos = ""
+
+    linhas = texto_pagina.split(" ")
+
+    # Tentativa simples de endereço
+    padroes_endereco = [
+        r"(Rua\s+[^|]{5,120})",
+        r"(Av\.?\s+[^|]{5,120})",
+        r"(Avenida\s+[^|]{5,120})",
+        r"(Shopping\s+[^|]{5,120})",
+        r"(Brás\s*[-,].{5,120})",
+    ]
+
+    for padrao in padroes_endereco:
+        achou = re.search(padrao, texto_pagina, re.IGNORECASE)
+        if achou:
+            endereco = limpar_texto(achou.group(1))
+            break
+
+    # Produtos/descrição: pega trecho de texto útil da página
+    produtos = texto_pagina[:1200]
+
+    telefone_limpo = limpar_whatsapp(whatsapp)
+
     return {
         "nome": limpar_texto(nome),
         "instagram": instagram,
         "whatsapp": whatsapp,
+        "telefone": telefone_limpo,
+        "site": site,
+        "endereco": endereco,
+        "produtos": produtos,
         "categoria": "",
         "regiao": "",
         "link_perfil": fornecedor["link"],
@@ -221,13 +249,13 @@ def fornecedor_ja_existe(link_perfil):
         .limit(1)
         .execute()
     )
-
     return bool(consulta.data)
 
 
 @app.get("/coletar")
-async def coletar(limite: int = 300, paginas: int = 10):
+async def coletar(limite: int = 300, paginas: int = 10, atualizar: bool = False):
     coletados = []
+    atualizados = []
     pulados = []
     erros = []
 
@@ -250,16 +278,15 @@ async def coletar(limite: int = 300, paginas: int = 10):
 
             if not login_ok:
                 await browser.close()
-                return {
-                    "status": "erro_login",
-                    "mensagem": "Login não confirmado"
-                }
+                return {"status": "erro_login", "mensagem": "Login não confirmado"}
 
             fornecedores = await navegar_paginas(page, limite=limite, paginas=paginas)
 
             for fornecedor in fornecedores:
                 try:
-                    if fornecedor_ja_existe(fornecedor["link"]):
+                    existe = fornecedor_ja_existe(fornecedor["link"])
+
+                    if existe and not atualizar:
                         pulados.append({
                             "nome": fornecedor["nome"],
                             "link_perfil": fornecedor["link"],
@@ -269,9 +296,15 @@ async def coletar(limite: int = 300, paginas: int = 10):
 
                     registro = await extrair_fornecedor(page, fornecedor)
 
-                    supabase.table("fornecedores_brasapp").insert(registro).execute()
-
-                    coletados.append(registro)
+                    if existe and atualizar:
+                        supabase.table("fornecedores_brasapp").update(registro).eq(
+                            "link_perfil",
+                            fornecedor["link"]
+                        ).execute()
+                        atualizados.append(registro)
+                    else:
+                        supabase.table("fornecedores_brasapp").insert(registro).execute()
+                        coletados.append(registro)
 
                 except Exception as e:
                     erros.append({
@@ -285,11 +318,14 @@ async def coletar(limite: int = 300, paginas: int = 10):
                 "status": "finalizado",
                 "limite": limite,
                 "paginas": paginas,
+                "atualizar": atualizar,
                 "total_encontrado": len(fornecedores),
                 "total_coletado_novo": len(coletados),
+                "total_atualizado": len(atualizados),
                 "total_pulado_repetido": len(pulados),
                 "total_erros": len(erros),
                 "dados": coletados,
+                "atualizados": atualizados,
                 "pulados": pulados,
                 "erros": erros
             }
