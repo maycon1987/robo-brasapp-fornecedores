@@ -13,7 +13,7 @@ BRASAPP_EMAIL = os.getenv("BRASAPP_EMAIL")
 BRASAPP_SENHA = os.getenv("BRASAPP_SENHA")
 
 URL_LOGIN = "https://bras.app/minha-conta/"
-URL_LISTA = "https://bras.app/lista-de-fornecedores-de-roupas-no-atacado-brasapp-explorar/?type=roupas&tab=categories"
+URL_BASE = "https://bras.app/lista-de-fornecedores-de-roupas-no-atacado-brasapp-explorar/?type=roupas&sort=a-z"
 
 supabase = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -62,17 +62,25 @@ async def fazer_login(page):
     return "Sair" in html or "logout" in html or "Minha conta" in titulo
 
 
-async def carregar_lista(page, scrolls=30):
-    await page.goto(URL_LISTA, wait_until="domcontentloaded", timeout=60000)
-    await page.wait_for_timeout(12000)
-
-    for i in range(scrolls):
-        print(f"Scroll {i + 1}/{scrolls}")
-        await page.mouse.wheel(0, 3500)
-        await page.wait_for_timeout(1500)
+def montar_url_pagina(pagina: int):
+    if pagina <= 1:
+        return URL_BASE
+    return f"{URL_BASE}&page={pagina}"
 
 
-async def pegar_links_fornecedores(page, limite):
+async def abrir_pagina_lista(page, pagina: int):
+    url = montar_url_pagina(pagina)
+    print(f"📄 Abrindo página {pagina}: {url}")
+
+    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    await page.wait_for_timeout(10000)
+
+    for _ in range(5):
+        await page.mouse.wheel(0, 3000)
+        await page.wait_for_timeout(1200)
+
+
+async def pegar_links_fornecedores(page):
     links = await page.locator("a").evaluate_all("""
         els => els.map(a => ({
             href: a.href || "",
@@ -128,7 +136,40 @@ async def pegar_links_fornecedores(page, limite):
             "link": href
         })
 
-    return fornecedores[:limite]
+    return fornecedores
+
+
+async def coletar_links_com_paginacao(page, limite: int, paginas: int):
+    todos = []
+    vistos = set()
+
+    for pagina in range(1, paginas + 1):
+        if len(todos) >= limite:
+            break
+
+        await abrir_pagina_lista(page, pagina)
+        encontrados = await pegar_links_fornecedores(page)
+
+        print(f"✅ Página {pagina}: {len(encontrados)} fornecedores encontrados")
+
+        novos_da_pagina = 0
+
+        for f in encontrados:
+            if f["link"] in vistos:
+                continue
+
+            vistos.add(f["link"])
+            todos.append(f)
+            novos_da_pagina += 1
+
+            if len(todos) >= limite:
+                break
+
+        if novos_da_pagina == 0:
+            print("⚠️ Página sem novos fornecedores. Parando.")
+            break
+
+    return todos[:limite]
 
 
 async def extrair_fornecedor(page, fornecedor):
@@ -193,7 +234,7 @@ def fornecedor_ja_existe(link_perfil):
 
 
 @app.get("/coletar")
-async def coletar(limite: int = 50, scrolls: int = 30):
+async def coletar(limite: int = 100, paginas: int = 10):
     if not supabase:
         return {"status": "erro", "erro": "Supabase não configurado"}
 
@@ -228,9 +269,7 @@ async def coletar(limite: int = 50, scrolls: int = 30):
                     "mensagem": "Login não confirmado"
                 }
 
-            await carregar_lista(page, scrolls)
-
-            fornecedores = await pegar_links_fornecedores(page, limite)
+            fornecedores = await coletar_links_com_paginacao(page, limite, paginas)
 
             if not fornecedores:
                 html = (await page.content())[:3000]
@@ -271,8 +310,8 @@ async def coletar(limite: int = 50, scrolls: int = 30):
             return {
                 "status": "finalizado",
                 "limite": limite,
-                "scrolls": scrolls,
-                "total_encontrado_na_pagina": len(fornecedores),
+                "paginas": paginas,
+                "total_encontrado": len(fornecedores),
                 "total_coletado_novo": len(coletados),
                 "total_pulado_repetido": len(pulados),
                 "total_erros": len(erros),
