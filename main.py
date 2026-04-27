@@ -1,4 +1,6 @@
-import os, re, traceback
+import os
+import re
+import traceback
 from fastapi import FastAPI
 from supabase import create_client
 from playwright.async_api import async_playwright
@@ -13,14 +15,21 @@ BRASAPP_SENHA = os.getenv("BRASAPP_SENHA")
 URL_LOGIN = "https://bras.app/minha-conta/"
 URL_LISTA = "https://bras.app/lista-de-fornecedores-de-roupas-no-atacado-brasapp-explorar/?type=roupas&tab=categories"
 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase = None
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def limpar(t):
-    return re.sub(r"\s+", " ", t or "").strip()
+
+def limpar_texto(texto):
+    if not texto:
+        return ""
+    return re.sub(r"\s+", " ", texto).strip()
+
 
 @app.get("/")
 def home():
     return {"status": "online", "app": "robo-brasapp-fornecedores"}
+
 
 @app.get("/debug")
 def debug():
@@ -31,18 +40,27 @@ def debug():
         "brasapp_senha_ok": bool(BRASAPP_SENHA),
     }
 
+
 async def fazer_login(page):
     await page.goto(URL_LOGIN, wait_until="domcontentloaded", timeout=60000)
     await page.wait_for_timeout(4000)
 
     await page.fill("#username", BRASAPP_EMAIL, timeout=15000)
     await page.fill("#password", BRASAPP_SENHA, timeout=15000)
-    await page.locator("button:has-text('Entrar')").first.click(timeout=15000)
+
+    botao = page.locator("button:has-text('Entrar')").first
+    if await botao.count() > 0:
+        await botao.click(timeout=15000)
+    else:
+        await page.click("button[type='submit']", timeout=15000)
 
     await page.wait_for_timeout(8000)
 
     html = await page.content()
-    return "Sair" in html or "logout" in html or "Minha conta" in await page.title()
+    titulo = await page.title()
+
+    return "Sair" in html or "logout" in html or "Minha conta" in titulo
+
 
 async def carregar_lista(page):
     await page.goto(URL_LISTA, wait_until="domcontentloaded", timeout=60000)
@@ -52,58 +70,80 @@ async def carregar_lista(page):
         await page.mouse.wheel(0, 3000)
         await page.wait_for_timeout(2000)
 
+
 async def pegar_links_fornecedores(page, limite):
     links = await page.locator("a").evaluate_all("""
         els => els.map(a => ({
             href: a.href || "",
-            text: (a.innerText || a.textContent || "").trim(),
-            cls: a.className || ""
+            text: (a.innerText || a.textContent || "").trim()
         }))
     """)
-
-    bloqueios = [
-        "minha-conta", "contato", "produto", "category=", "region=",
-        "sort=", "tab=categories", "login", "register", "lost-password",
-        "#", "mailto:", "whatsapp", "instagram", "cliks.com.br"
-    ]
 
     fornecedores = []
     vistos = set()
 
     for item in links:
         href = item.get("href", "")
-        nome = limpar(item.get("text", ""))
+        nome = limpar_texto(item.get("text", ""))
+
+        if not href:
+            continue
 
         if not href.startswith("https://bras.app/"):
             continue
 
-        if any(b in href for b in bloqueios):
+        # filtro principal: perfil real de fornecedor
+        if "lista-de-fornecedores-de-roupas-no-atacado-bras-resultado/" not in href:
             continue
 
-        if href.rstrip("/") in ["https://bras.app", "https://bras.app/"]:
+        # ignora lixo/menu/logout
+        bloqueados = [
+            "member-logout",
+            "logout",
+            "minha-conta",
+            "lost-password",
+            "register",
+            "produto",
+            "contato",
+            "category=",
+            "region=",
+            "sort=",
+            "tab=",
+            "#",
+        ]
+
+        if any(b in href.lower() for b in bloqueados):
             continue
+
+        if len(nome) < 2:
+            # se o link não tiver texto, tenta usar slug da URL
+            slug = href.rstrip("/").split("/")[-1]
+            nome = slug.replace("-", " ").title()
 
         if href in vistos:
             continue
 
-        # aceita link interno com cara de perfil
-        if nome or "listing" in item.get("cls", "").lower() or "/fornecedor" in href:
-            vistos.add(href)
-            fornecedores.append({"nome": nome, "link": href})
+        vistos.add(href)
 
-    return fornecedores[:limite], links[:80]
+        fornecedores.append({
+            "nome": nome,
+            "link": href
+        })
 
-async def extrair_fornecedor(page, f):
-    await page.goto(f["link"], wait_until="domcontentloaded", timeout=60000)
+    return fornecedores[:limite]
+
+
+async def extrair_fornecedor(page, fornecedor):
+    await page.goto(fornecedor["link"], wait_until="domcontentloaded", timeout=60000)
     await page.wait_for_timeout(6000)
 
-    nome = f.get("nome") or ""
+    nome = fornecedor.get("nome") or ""
 
     try:
         h1 = page.locator("h1").first
         if await h1.count() > 0:
             nome = await h1.inner_text()
-    except:
+    except Exception:
         pass
 
     instagram = ""
@@ -116,74 +156,104 @@ async def extrair_fornecedor(page, f):
         }))
     """)
 
-    for a in links:
-        href = a.get("href", "")
+    for item in links:
+        href = item.get("href", "")
+
         if not instagram and "instagram.com" in href:
             instagram = href
-        if not whatsapp and ("wa.me" in href or "api.whatsapp.com" in href or "whatsapp" in href.lower()):
+
+        if not whatsapp and (
+            "wa.me" in href
+            or "api.whatsapp.com" in href
+            or "web.whatsapp.com" in href
+            or "whatsapp" in href.lower()
+        ):
             whatsapp = href
 
     return {
-        "nome": limpar(nome),
+        "nome": limpar_texto(nome),
         "instagram": instagram,
         "whatsapp": whatsapp,
         "categoria": "",
         "regiao": "",
-        "link_perfil": f["link"],
+        "link_perfil": fornecedor["link"],
         "status": "coletado"
     }
 
+
 @app.get("/coletar")
 async def coletar(limite: int = 3):
+    if not supabase:
+        return {"status": "erro", "erro": "Supabase não configurado"}
+
+    if not BRASAPP_EMAIL or not BRASAPP_SENHA:
+        return {"status": "erro", "erro": "BRASAPP_EMAIL ou BRASAPP_SENHA não configurados"}
+
+    coletados = []
+    erros = []
+
     try:
         async with async_playwright() as p:
             browser = await p.firefox.launch(headless=True)
-            context = await browser.new_context(viewport={"width": 1366, "height": 900})
+
+            context = await browser.new_context(
+                viewport={"width": 1366, "height": 900},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                )
+            )
+
             page = await context.new_page()
 
             login_ok = await fazer_login(page)
+
             if not login_ok:
                 await browser.close()
-                return {"status": "erro_login", "mensagem": "Login não confirmado"}
+                return {
+                    "status": "erro_login",
+                    "mensagem": "Login não confirmado"
+                }
 
             await carregar_lista(page)
 
-            fornecedores, amostra_links = await pegar_links_fornecedores(page, limite)
+            fornecedores = await pegar_links_fornecedores(page, limite)
 
             if not fornecedores:
                 html = (await page.content())[:3000]
                 await browser.close()
                 return {
                     "status": "sem_fornecedores",
-                    "mensagem": "Não achei links de perfil. Veja amostra_links para ajustar seletor.",
+                    "mensagem": "Não encontrei links reais de fornecedores.",
                     "url_atual": page.url,
-                    "amostra_links": amostra_links,
                     "html_inicio": html
                 }
 
-            dados = []
-            erros = []
-
-            for f in fornecedores:
+            for fornecedor in fornecedores:
                 try:
-                    registro = await extrair_fornecedor(page, f)
+                    registro = await extrair_fornecedor(page, fornecedor)
 
                     supabase.table("fornecedores_brasapp").upsert(
                         registro,
                         on_conflict="link_perfil"
                     ).execute()
 
-                    dados.append(registro)
+                    coletados.append(registro)
+
                 except Exception as e:
-                    erros.append({"fornecedor": f, "erro": str(e)})
+                    erros.append({
+                        "fornecedor": fornecedor,
+                        "erro": str(e)
+                    })
 
             await browser.close()
 
             return {
                 "status": "finalizado",
-                "total_coletado": len(dados),
+                "total_coletado": len(coletados),
                 "total_erros": len(erros),
-                "dados": dados,
+                "dados": coletados,
                 "erros": erros
             }
 
