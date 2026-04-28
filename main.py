@@ -1,7 +1,10 @@
 import os
 import re
 import traceback
+from typing import Optional
+
 from fastapi import FastAPI
+from pydantic import BaseModel
 from supabase import create_client
 from playwright.async_api import async_playwright
 
@@ -15,8 +18,14 @@ BRASAPP_SENHA = os.getenv("BRASAPP_SENHA")
 URL_LOGIN = "https://bras.app/minha-conta/"
 URL_LISTA = "https://bras.app/lista-de-fornecedores-de-roupas-no-atacado-brasapp-explorar/?type=roupas&tab=categories"
 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase = None
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+
+# ============================================================
+# FUNÇÕES GERAIS
+# ============================================================
 
 def limpar_texto(texto):
     if not texto:
@@ -25,15 +34,75 @@ def limpar_texto(texto):
 
 
 def limpar_whatsapp(link):
+    """
+    Extrai apenas o telefone do link do WhatsApp.
+    Ex:
+    https://wa.me/5511963050794/?text=...
+    vira:
+    5511963050794
+    """
     if not link:
         return ""
-    numeros = re.findall(r"\d+", link)
-    return "".join(numeros) if numeros else link
 
+    match = re.search(r"(?:wa\.me/|phone=)(\d{10,15})", link)
+    if match:
+        return match.group(1)
+
+    numeros = re.findall(r"\d{10,15}", link)
+    return numeros[0] if numeros else ""
+
+
+def detectar_plataforma(url: str):
+    url_lower = (url or "").lower()
+
+    if "tiktok.com" in url_lower:
+        return "tiktok"
+
+    if "instagram.com" in url_lower:
+        if "/reel/" in url_lower or "/reels/" in url_lower:
+            return "instagram_reels"
+        return "instagram"
+
+    if "youtube.com" in url_lower or "youtu.be" in url_lower:
+        return "youtube"
+
+    return "outro"
+
+
+def gerar_embed_html(url: str, plataforma: str):
+    """
+    Embed simples para exibir na home.
+    Depois dá para evoluir para oEmbed oficial.
+    """
+    if not url:
+        return ""
+
+    if plataforma == "tiktok":
+        return f'<blockquote class="tiktok-embed" cite="{url}" data-video-id=""><a href="{url}">Ver vídeo no TikTok</a></blockquote>'
+
+    if plataforma in ["instagram", "instagram_reels"]:
+        return f'<blockquote class="instagram-media" data-instgrm-permalink="{url}"><a href="{url}">Ver no Instagram</a></blockquote>'
+
+    if plataforma == "youtube":
+        return f'<a href="{url}" target="_blank">Ver vídeo no YouTube</a>'
+
+    return f'<a href="{url}" target="_blank">Ver vídeo</a>'
+
+
+# ============================================================
+# ROTAS BÁSICAS
+# ============================================================
 
 @app.get("/")
 def home():
-    return {"status": "online", "app": "robo-brasapp-fornecedores"}
+    return {
+        "status": "online",
+        "app": "robo-brasapp-fornecedores",
+        "modulos": [
+            "brasapp",
+            "videos_fornecedores"
+        ]
+    }
 
 
 @app.get("/debug")
@@ -45,6 +114,119 @@ def debug():
         "brasapp_senha_ok": bool(BRASAPP_SENHA),
     }
 
+
+# ============================================================
+# MÓDULO VIDEOS DE FORNECEDORES
+# ============================================================
+
+class VideoFornecedorInput(BaseModel):
+    url_video: str
+    titulo: Optional[str] = None
+    observacao: Optional[str] = None
+    fornecedor_id: Optional[int] = None
+    plataforma: Optional[str] = None
+
+
+@app.post("/postar-video")
+def postar_video(video: VideoFornecedorInput):
+    """
+    Salva um link de vídeo na tabela videos_fornecedores.
+    Use para TikTok, Instagram Reels, YouTube Shorts etc.
+    """
+    if not supabase:
+        return {
+            "status": "erro",
+            "erro": "Supabase não configurado"
+        }
+
+    url_video = limpar_texto(video.url_video)
+
+    if not url_video:
+        return {
+            "status": "erro",
+            "erro": "url_video é obrigatório"
+        }
+
+    plataforma = video.plataforma or detectar_plataforma(url_video)
+    embed_html = gerar_embed_html(url_video, plataforma)
+
+    registro = {
+        "fornecedor_id": video.fornecedor_id,
+        "plataforma": plataforma,
+        "url_video": url_video,
+        "embed_html": embed_html,
+        "titulo": limpar_texto(video.titulo),
+        "observacao": limpar_texto(video.observacao),
+        "status": "pendente",
+    }
+
+    try:
+        resultado = (
+            supabase
+            .table("videos_fornecedores")
+            .insert(registro)
+            .execute()
+        )
+
+        return {
+            "status": "ok",
+            "mensagem": "Vídeo salvo com sucesso",
+            "video": resultado.data[0] if resultado.data else registro
+        }
+
+    except Exception as e:
+        return {
+            "status": "erro",
+            "erro": str(e),
+            "trace": traceback.format_exc()
+        }
+
+
+@app.get("/listar-videos")
+def listar_videos(limite: int = 20, status: Optional[str] = None):
+    """
+    Lista vídeos salvos para aparecerem na home.
+    Ex:
+    /listar-videos?limite=20
+    /listar-videos?status=pendente
+    """
+    if not supabase:
+        return {
+            "status": "erro",
+            "erro": "Supabase não configurado"
+        }
+
+    try:
+        query = (
+            supabase
+            .table("videos_fornecedores")
+            .select("*")
+            .order("criado_em", desc=True)
+            .limit(limite)
+        )
+
+        if status:
+            query = query.eq("status", status)
+
+        resultado = query.execute()
+
+        return {
+            "status": "ok",
+            "total": len(resultado.data or []),
+            "videos": resultado.data or []
+        }
+
+    except Exception as e:
+        return {
+            "status": "erro",
+            "erro": str(e),
+            "trace": traceback.format_exc()
+        }
+
+
+# ============================================================
+# MÓDULO BRASAPP
+# ============================================================
 
 async def fazer_login(page):
     await page.goto(URL_LOGIN, wait_until="domcontentloaded", timeout=60000)
@@ -101,7 +283,10 @@ async def pegar_links(page):
             slug = href.rstrip("/").split("/")[-1]
             nome = slug.replace("-", " ").title()
 
-        fornecedores.append({"nome": nome, "link": href})
+        fornecedores.append({
+            "nome": nome,
+            "link": href
+        })
 
     return fornecedores
 
@@ -114,6 +299,8 @@ async def navegar_paginas(page, limite=300, paginas=10):
     await page.wait_for_timeout(10000)
 
     for pagina in range(1, paginas + 1):
+        print(f"📄 Página {pagina}")
+
         await page.wait_for_timeout(4000)
 
         fornecedores = await pegar_links(page)
@@ -137,9 +324,11 @@ async def navegar_paginas(page, limite=300, paginas=10):
                 await botao_pagina.click(timeout=10000)
                 await page.wait_for_timeout(8000)
             else:
+                print("Fim das páginas")
                 break
 
-        except Exception:
+        except Exception as e:
+            print("Erro ao clicar na próxima página:", e)
             break
 
     return todos
@@ -190,6 +379,9 @@ async def extrair_fornecedor(page, fornecedor):
             and "instagram.com" not in href
             and "wa.me" not in href
             and "whatsapp" not in href.lower()
+            and "maps.google.com" not in href
+            and "google.com/maps" not in href
+            and "cliks.com.br" not in href
         ):
             site = href
 
@@ -203,26 +395,20 @@ async def extrair_fornecedor(page, fornecedor):
     endereco = ""
     produtos = ""
 
-    linhas = texto_pagina.split(" ")
-
-    # Tentativa simples de endereço
     padroes_endereco = [
-        r"(Rua\s+[^|]{5,120})",
-        r"(Av\.?\s+[^|]{5,120})",
-        r"(Avenida\s+[^|]{5,120})",
-        r"(Shopping\s+[^|]{5,120})",
-        r"(Brás\s*[-,].{5,120})",
+        r"((?:R\.|Rua)\s+[^|]{5,140}?\d+[^|]{0,80}?(?:SP|RJ|PR|MG|SC|RS|BA|GO|PE|CE|ES|DF|MT|MS|PA|AM|PB|RN|AL|SE|MA|PI|TO|RO|AC|RR|AP))",
+        r"((?:Av\.|Avenida)\s+[^|]{5,140}?\d+[^|]{0,80}?(?:SP|RJ|PR|MG|SC|RS|BA|GO|PE|CE|ES|DF|MT|MS|PA|AM|PB|RN|AL|SE|MA|PI|TO|RO|AC|RR|AP))",
+        r"(Shopping\s+[^|]{5,140})",
     ]
 
     for padrao in padroes_endereco:
         achou = re.search(padrao, texto_pagina, re.IGNORECASE)
         if achou:
             endereco = limpar_texto(achou.group(1))
+            endereco = endereco.replace("Obter instruções", "").strip()
             break
 
-    # Produtos/descrição: pega trecho de texto útil da página
     produtos = texto_pagina[:1200]
-
     telefone_limpo = limpar_whatsapp(whatsapp)
 
     return {
@@ -259,6 +445,18 @@ async def coletar(limite: int = 300, paginas: int = 10, atualizar: bool = False)
     pulados = []
     erros = []
 
+    if not supabase:
+        return {
+            "status": "erro",
+            "erro": "Supabase não configurado"
+        }
+
+    if not BRASAPP_EMAIL or not BRASAPP_SENHA:
+        return {
+            "status": "erro",
+            "erro": "BRASAPP_EMAIL ou BRASAPP_SENHA não configurados"
+        }
+
     try:
         async with async_playwright() as p:
             browser = await p.firefox.launch(headless=True)
@@ -278,7 +476,10 @@ async def coletar(limite: int = 300, paginas: int = 10, atualizar: bool = False)
 
             if not login_ok:
                 await browser.close()
-                return {"status": "erro_login", "mensagem": "Login não confirmado"}
+                return {
+                    "status": "erro_login",
+                    "mensagem": "Login não confirmado"
+                }
 
             fornecedores = await navegar_paginas(page, limite=limite, paginas=paginas)
 
